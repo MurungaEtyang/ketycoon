@@ -1,89 +1,111 @@
+const express = require('express');
+const bodyParser = require('body-parser');
+const https = require('https');
+const fetch = require('cross-fetch');
+const { Connection, Keypair, VersionedTransaction } = require('@solana/web3.js');
+const { Wallet } = require('@project-serum/anchor');
+const bs58 = require('bs58');
 require('dotenv').config();
 
-/**
- * Module dependencies.
- */
+const agent = new https.Agent({ rejectUnauthorized: false });
 
-const app = require('./app');
-const http = require('http');
+const requiredEnvVars = ['RPC_URL', 'PRIVATE_KEY_SOLFLAIRE', 'JUPITER_URL_QUOTE', 'JUPITER_URL_SWAP', 'INPUT_MINT', 'OUTPUT_MINT', 'AMOUNT_SOL', 'SLIPPAGE', 'PORT'];
 
-/**
- * Get port from environment and store in Express.
- */
+requiredEnvVars.forEach((varName) => {
+    if (!process.env[varName]) {
+        throw new Error(`${varName} environment variable is not set`);
+    }
+});
 
-const port = normalizePort(process.env.PORT || '3000');
-app.set('port', port);
+const connection = new Connection(process.env.RPC_URL, { agent });
+const privateKey = process.env.PRIVATE_KEY_SOLFLAIRE;
+const wallet = new Wallet(Keypair.fromSecretKey(bs58.decode(privateKey)));
 
-/**
- * Create HTTP server.
- */
+const urlApi = process.env.JUPITER_URL_QUOTE;
+const inputMint = process.env.INPUT_MINT;
+const outputMint = process.env.OUTPUT_MINT;
+const amount = process.env.AMOUNT_SOL * 1000000000;
+const slippage = process.env.SLIPPAGE;
 
-const server = http.createServer(app);
+const app = express();
+app.use(bodyParser.json());
 
-/**
- * Listen on provided port, on all network interfaces.
- */
+async function getQuoteAndSwap() {
+    const logs = [];
+    const log = (...args) => {
+        const message = args.join(' ');
+        logs.push(message);
+        console.log(message);
+    };
 
-server.listen(port);
-server.on('error', onError);
-server.on('listening', onListening);
+    try {
+        const balance = await connection.getBalance(wallet.publicKey);
+        log('Balance:', balance/1000000000, 'SOL');
 
-/**
- * Normalize a port into a number, string, or false.
- */
+        const minBalance = 5000/1000000000;
+        if (balance < minBalance) {
+            throw new Error(`Your Balance is below the minimum `, minBalance);
+        }
 
-function normalizePort(val) {
-  const port = parseInt(val, 10);
+        const quoteResponse = await fetch(`${urlApi}?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippage}`, { agent });
+        if (!quoteResponse.ok) {
+            throw new Error(`Failed to fetch quote: ${quoteResponse.statusText}`);
+        }
+        const quoteData = await quoteResponse.json();
+        log('Quote Data:', JSON.stringify(quoteData));
 
-  if (isNaN(port)) {
-    // named pipe
-    return val;
-  }
+        const swapResponse = await fetch(process.env.JUPITER_URL_SWAP, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                quoteResponse: quoteData,
+                userPublicKey: wallet.publicKey.toString(),
+                wrapAndUnwrapSol: true,
+            }),
+            agent,
+        });
 
-  if (port >= 0) {
-    // port number
-    return port;
-  }
+        if (!swapResponse.ok) {
+            const swapErrorData = await swapResponse.text();
+            throw new Error(`Failed to fetch swap transaction: ${swapResponse.statusText} - ${swapErrorData}`);
+        }
 
-  return false;
+        const swapData = await swapResponse.json();
+        const { swapTransaction } = swapData;
+        log('Swap Transaction:', swapTransaction);
+
+        const swapTransactionBuf = Buffer.from(swapTransaction, 'base64');
+        const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
+
+        const latestBlockhash = await connection.getLatestBlockhash();
+        log('Updated Blockhash:', JSON.stringify(latestBlockhash));
+
+        transaction.message.recentBlockhash = latestBlockhash.blockhash;
+        transaction.sign([wallet.payer]);
+
+        log('Please wait, the process has started...');
+        const rawTransaction = transaction.serialize();
+        const txid = await connection.sendRawTransaction(rawTransaction, {
+            skipPreflight: true,
+            maxRetries: 2,
+        });
+
+        log('Confirming transaction...');
+        await connection.confirmTransaction(txid, 'processed');
+        log(`Transaction ${txid} has been confirmed.`);
+        return { success: true, txid, logs };
+    } catch (error) {
+        log('Error:', error.message);
+        return { success: false, error: error.message, logs };
+    }
 }
 
-/**
- * Event listener for HTTP server "error" event.
- */
+app.get('/swap', async (req, res) => {
+    const result = await getQuoteAndSwap();
+    res.json(result);
+});
 
-function onError(error) {
-  if (error.syscall !== 'listen') {
-    throw error;
-  }
-
-  const bind = typeof port === 'string'
-    ? 'Pipe ' + port
-    : 'Port ' + port;
-
-  // handle specific listen errors with friendly messages
-  switch (error.code) {
-    case 'EACCES':
-      console.error(bind + ' requires elevated privileges');
-      process.exit(1);
-      break;
-    case 'EADDRINUSE':
-      console.error(bind + ' is already in use');
-      process.exit(1);
-      break;
-    default:
-      throw error;
-  }
-}
-
-/**
- * Event listener for HTTP server "listening" event.
- */
-
-function onListening() {
-  const addr = server.address();
-  const bind = typeof addr === 'string'
-    ? 'pipe ' + addr
-    : 'port ' + addr.port;
-  console.log('App started. Listening on ' + bind);
-}
+const PORT = process.env.PORT;
+app.listen(PORT, () => {
+    console.log(`Server is running on port ${PORT}`);
+});
